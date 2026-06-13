@@ -1,5 +1,7 @@
 # mqo-duckdb-handle-store
 
+> Part of the **[mqo-mcp](https://github.com/joeyen-atscale/mqo-mcp)** fleet — the AtScale MQO/MCP engine for AI analytics.
+
 Result-set handle store for `mqo-mcp-server`. Stores `run_query` result sets out of
 the LLM context window and returns an opaque `{handle, row_count, schema}` envelope
 instead. Rows are retrieved on demand via bounded `get_rows(handle, offset, limit)`.
