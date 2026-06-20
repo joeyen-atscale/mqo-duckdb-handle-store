@@ -1,22 +1,28 @@
 # mqo-duckdb-handle-store
 
-> Part of the **[mqo-mcp](https://github.com/joeyen-atscale/mqo-mcp)** fleet — the AtScale MQO/MCP engine for AI analytics.
+A result-set store that keeps query rows out of an LLM's context window and hands back an opaque `{handle, row_count, schema}` envelope instead of the rows themselves.
 
-Result-set handle store for `mqo-mcp-server`. Stores `run_query` result sets out of
-the LLM context window and returns an opaque `{handle, row_count, schema}` envelope
-instead. Rows are retrieved on demand via bounded `get_rows(handle, offset, limit)`.
+## Why it exists
 
-## TL;DR
+A `run_query` against a semantic layer can return thousands of rows. Streaming those rows into a model's context is the wrong default: it burns tokens, and the model rarely needs every row at once — it needs to know the result exists, how big it is, and what its columns are, then pull bounded slices on demand.
 
-ATSCALE-49212 asks to "store MCP `run_query` result sets in an external resource and
-return an opaque handle to the LLM instead of the full row data." This library is the
-DuckDB instantiation of that idea, plus a lightweight pure-Rust `MemStore` default that
-keeps CI fast. The DuckDB backend is an opt-in Cargo feature (`--features duckdb`) so
-the heavy bundled C++ build is never pulled in unless explicitly requested.
+This library does that split. `put` stores the rows and returns only the envelope. The model reasons over the handle and the shape; rows come back through `get_rows(handle, offset, limit)`, never all at once. The store is the backing piece behind `mqo-mcp-server`'s handle-based result flow.
 
-## Usage
+There are two implementations behind one trait. `MemStore` is pure Rust — a `HashMap` with TTL and an optional row cap — and is the default, so the common build pulls no heavy dependencies and CI stays fast. `DuckStore` puts the rows in an in-process DuckDB table per handle, which is the path that lets downstream operations run SQL over stored results; it is opt-in behind a Cargo feature so the bundled DuckDB C++ build is never compiled unless you ask for it.
 
-### Default: MemStore (no extra deps)
+## Install
+
+```toml
+# default: MemStore only, no DuckDB
+mqo-duckdb-handle-store = "0.1"
+
+# opt in to the DuckDB backend (compiles a bundled DuckDB; slow first build)
+mqo-duckdb-handle-store = { version = "0.1", features = ["duckdb"] }
+```
+
+## Quickstart
+
+Both backends implement the same `ResultStore` trait: `put` / `get_rows` / `metadata` / `evict_expired`.
 
 ```rust
 use mqo_duckdb_handle_store::{MemStore, ResultStore, ColumnSchema};
@@ -24,66 +30,50 @@ use mqo_duckdb_handle_store::mem_store::MemStoreConfig;
 use serde_json::json;
 
 let mut store = MemStore::new(MemStoreConfig {
-    ttl_secs: 3600,    // evict handles older than 1 hour
-    total_row_cap: 50_000,  // LRU-evict if total rows would exceed this
+    ttl_secs: 3600,        // evict handles older than one hour
+    total_row_cap: 50_000, // 0 = unlimited; otherwise LRU-evict to stay under
 });
 
 let rows = vec![json!({"city": "NYC", "sales": 100})];
 let schema = vec![ColumnSchema { name: "city".into(), ty: "STRING".into() }];
 
-// put() injects now_unix — no wall-clock reads
-let env = store.put(&rows, &schema, /* now_unix */ 1_718_000_000).unwrap();
-// env = HandleEnvelope { handle: DatasetHandle("...uuid..."), row_count: 1, schema: [...] }
-// rows are NOT in the envelope
+// Store the rows; get back the envelope — the rows are NOT in it.
+// `now_unix` is supplied by the caller; the store never reads a clock.
+let env = store.put(&rows, &schema, 1_718_000_000).unwrap();
+// env.handle, env.row_count == 1, env.schema
 
-// fetch a slice
+// Pull a bounded slice on demand.
 let slice = store.get_rows(&env.handle, 0, 10).unwrap();
 
-// metadata without row materialisation
+// Read shape (row_count + schema) without materialising any rows.
 let meta = store.metadata(&env.handle).unwrap();
 
-// TTL eviction (inject current time; store never reads SystemTime)
+// Drop handles past their TTL — again, the time is injected.
 store.evict_expired(1_718_003_601);
 ```
 
-### Opt-in: DuckStore (`--features duckdb`)
-
-Add to `Cargo.toml`:
-
-```toml
-mqo-duckdb-handle-store = { version = "0.1", features = ["duckdb"] }
-```
-
-Then:
+The DuckDB backend is a drop-in for the same trait:
 
 ```rust
 use mqo_duckdb_handle_store::{DuckStore, ResultStore};
-use mqo_duckdb_handle_store::duck_store::DuckStoreConfig;
 
-let mut store = DuckStore::with_defaults().unwrap();
-// Same ResultStore trait — put/get_rows/metadata/evict_expired
-// Each handle maps to a DuckDB table `_h_<uuid>`, enabling SQL ops over stored rows.
+let mut store = DuckStore::with_defaults().unwrap(); // --features duckdb
 ```
 
-The `--features duckdb` build pulls in the `duckdb` crate with the `bundled` feature
-(compiles a large C++ amalgamation). This is intentionally opt-in.
+## How it works
 
-## Acceptance criteria
+- **The envelope carries shape, not data.** `put` returns `{handle, row_count, schema}`. Rows only ever leave through `get_rows`, bounded by `offset`/`limit`. An out-of-range offset returns an empty `Vec`, not an error.
+- **Handles are immutable.** Every `put` allocates a fresh UUID; nothing overwrites an existing handle.
+- **Time is injected.** Every method that cares about time takes `now_unix: u64` from the caller. There is no `SystemTime::now()` in the crate, which makes TTL and eviction deterministic to test.
+- **Eviction has two triggers.** `evict_expired(now)` drops handles past their TTL. A non-zero `total_row_cap` makes `put` LRU-evict — oldest-accessed first — until the incoming rows fit.
+- **`metadata` never reads rows.** It returns the envelope from in-memory bookkeeping; in `DuckStore` it touches the meta map only, not the data tables.
 
-| AC | Status | Description |
-|----|--------|-------------|
-| AC1 | MUST | `put` returns envelope with `row_count == rows.len()`, schema echoed, no rows |
-| AC2 | MUST | `get_rows(h, offset, limit)` returns exact slice; out-of-range offset → empty Vec |
-| AC3 | MUST | `metadata` returns envelope without materialising rows |
-| AC4 | MUST | Two identical `put` calls return distinct handles (immutable-derive) |
-| AC5 | MUST | `evict_expired(now)` drops stale handles; `get_rows` returns `HandleNotFound` |
-| AC6 | MUST | Total-row cap triggers LRU eviction; cap never exceeded |
-| AC7 | SHOULD | `DuckStore` satisfies AC1–AC5 (behind `--features duckdb`); default build excludes DuckDB |
-| AC8 | MUST | `cargo test` (default) passes; `cargo clippy -D warnings` clean; zero `unsafe` |
+`DuckStore` stores each handle's rows in its own table (`_h_<uuid>`), one row per record in a single `_row_json TEXT` column. That keeps storage schema-agnostic; SQL over a stored result reads the JSON via DuckDB's `json_extract` rather than typed columns. Tables are dropped on eviction and on `Drop`.
 
-## Design notes
+## Where it fits
 
-- **Time is injected** — `now_unix: u64` is a caller arg; no `std::time::SystemTime::now()` anywhere.
-- **Immutable derive** — every `put` allocates a fresh UUID handle; nothing overwrites an existing one.
-- **Feature gate** — `[features] duckdb = ["dep:duckdb"]` in Cargo.toml; default build is pure Rust.
-- **Zero `unsafe`** — confirmed by `grep -r 'unsafe' src/`.
+Part of the **[mqo-mcp](https://github.com/joeyen-atscale/mqo-mcp)** fleet — the AtScale MQO/MCP engine for AI analytics. This crate is the storage layer for that server's handle-based result flow, the piece that keeps large `run_query` results addressable without putting them in the model's context.
+
+## Status
+
+Version 0.1. The default `MemStore` path is covered by the acceptance tests in `tests/` (run `cargo test`). The `DuckStore` backend is gated behind `--features duckdb` and tested separately (`cargo test --features duckdb`); the default build excludes DuckDB entirely. The crate contains no `unsafe`.
